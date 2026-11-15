@@ -1,0 +1,125 @@
+name: Build and publish Docker image
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - docker/**
+      - .github/workflows/docker-publish.yml
+      - packages/**
+      - package.json
+      - pnpm-lock.yaml
+      - pnpm-workspace.yaml
+      - tsconfig.base.json
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Prepare image metadata
+        id: meta
+        shell: bash
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          base=$(git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' 2>/dev/null || echo v0.0.0)
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "version=${base#v}-docker.${GITHUB_RUN_NUMBER}+${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "sha_tag=$image:sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image for startup verification
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: napcat-smoke:local
+          build-args: |
+            NAPCAT_VERSION=${{ steps.meta.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Verify startup and persistent configuration
+        shell: bash
+        run: |
+          bash -n docker/entrypoint.sh
+          token=$(openssl rand -hex 24)
+          echo "::add-mask::$token"
+          docker run -d --name napcat-smoke \
+            -p 127.0.0.1:6099:6099 \
+            -e NAPCAT_WEBUI_SECRET_KEY="$token" \
+            napcat-smoke:local
+          wait_for_webui() {
+            for attempt in $(seq 1 60); do
+              if [[ $(docker inspect -f '{{.State.Running}}' napcat-smoke) != true ]]; then
+                echo '容器在 WebUI 就绪前退出'
+                return 1
+              fi
+              if curl --fail --silent http://127.0.0.1:6099/webui/ -o "$RUNNER_TEMP/webui.html" \
+                && grep -qi '<html' "$RUNNER_TEMP/webui.html"; then
+                return 0
+              fi
+              sleep 2
+            done
+            echo 'WebUI 启动超时'
+            return 1
+          }
+          wait_for_webui
+          docker exec napcat-smoke jq -e --arg token "$token" \
+            '.token == $token and .host == "0.0.0.0"' /app/napcat/config/webui.json
+          before=$(docker exec napcat-smoke sha256sum /app/napcat/config/webui.json)
+          docker restart --time 15 napcat-smoke
+          wait_for_webui
+          after=$(docker exec napcat-smoke sha256sum /app/napcat/config/webui.json)
+          test "$before" = "$after"
+          docker exec napcat-smoke test -s /app/napcat/napcat.mjs
+
+      - name: Print startup failure details
+        if: failure()
+        run: docker logs --tail 100 napcat-smoke || true
+
+      - name: Remove test container
+        if: always()
+        run: docker rm -fv napcat-smoke || true
+
+      # 分支推送只验证；默认分支或手动运行通过验证后才发布。
+      - name: Log in to GHCR
+        if: github.ref_name == github.event.repository.default_branch || github.event_name == 'workflow_dispatch'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish verified image
+        if: github.ref_name == github.event.repository.default_branch || github.event_name == 'workflow_dispatch'
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          SHA_TAG: ${{ steps.meta.outputs.sha_tag }}
+        run: |
+          docker tag napcat-smoke:local "$SHA_TAG"
+          docker push "$SHA_TAG"
+          if [[ "$GITHUB_REF_NAME" == '${{ github.event.repository.default_branch }}' ]]; then
+            docker tag napcat-smoke:local "$IMAGE:latest"
+            docker push "$IMAGE:latest"
+          fi
+          echo "已发布并通过 WebUI 启动验证：\`$SHA_TAG\`" >> "$GITHUB_STEP_SUMMARY"
